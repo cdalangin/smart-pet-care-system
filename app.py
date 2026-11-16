@@ -111,7 +111,7 @@ if all_tasks:
             [
                 {
                     "Pet": t.pet_name,
-                    "Task": t.name,
+                    "Task": ("💡 " if t.suggested else "") + t.name,
                     "Time": t.preference or "—",
                     "Minutes": t.duration,
                     "Priority": t.priority,
@@ -149,6 +149,9 @@ st.subheader("Build Schedule")
 st.caption("Picks tasks by priority until time runs out, then lists them in time order.")
 
 if st.button("Generate schedule"):
+    st.session_state.show_plan = True
+
+if st.session_state.get("show_plan"):
     scheduler = Scheduler(owner=owner)
     plan = scheduler.generate_plan()
     used = sum(t.duration for t in plan)
@@ -172,6 +175,7 @@ if st.button("Generate schedule"):
                     "Task": t.name,
                     "Minutes": t.duration,
                     "Priority": t.priority,
+                    "Source": "💡 Suggested" if t.suggested else "Your task",
                 }
                 for t in plan
             ]
@@ -181,9 +185,29 @@ if st.button("Generate schedule"):
         st.warning(warning)
     if scheduler.skipped_tasks:
         st.warning(
-            "Skipped, not enough time: "
+            "Skipped (not enough time or overlapping a higher-priority task): "
             + ", ".join(f"{t.name} ({t.pet_name}, {t.duration} min)" for t in scheduler.skipped_tasks)
         )
 
+    declined = st.session_state.setdefault("declined", set())
+    suggestions = scheduler.suggest_tasks(declined)
+    if suggestions:
+        st.markdown("#### 💡 Suggested tasks")
+        st.caption(
+            f"You have {owner.availability - used} minutes free. Accept a suggestion to add it "
+            "to the schedule at the time shown, or decline it."
+        )
+        for i, s in enumerate(suggestions):
+            c1, c2, c3 = st.columns([5, 1, 1])
+            c1.write(f"💡 **{s.name}** for {s.pet_name} at **{s.preference}** ({s.duration} min, {s.priority} priority)")
+            if c2.button("Accept", key=f"accept_{i}_{s.pet_name}_{s.name}"):
+                pet = next(p for p in owner.pets if p.name == s.pet_name)
+                pet.add_task(s)
+                st.session_state.flash = f"Added suggested task '{s.name}' for {s.pet_name} at {s.preference}."
+                st.rerun()
+            if c3.button("Decline", key=f"decline_{i}_{s.pet_name}_{s.name}"):
+                declined.add((s.pet_name, s.name.lower()))
+                st.rerun()
+
     with st.expander("Why this plan?"):
-        st.text(scheduler.explain())
+        st.text(scheduler.explain(suggestions))
