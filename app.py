@@ -19,43 +19,19 @@ st.title("🐾 PawPal+")
 
 st.markdown(
     """
-Welcome to the PawPal+ starter app.
+Welcome to PawPal+!
 
-This file is intentionally thin. It gives you a working Streamlit app so you can start quickly,
-but **it does not implement the project logic**. Your job is to design the system and build it.
-
-Use this app as your interactive demo once your backend classes/functions exist.
+This is a pet care planning assistant. It helps a pet owner plan care tasks for their pet(s) based on constraints like time, priority, and preferences.
 """
 )
 
-with st.expander("Scenario", expanded=True):
-    st.markdown(
-        """
-**PawPal+** is a pet care planning assistant. It helps a pet owner plan care tasks
-for their pet(s) based on constraints like time, priority, and preferences.
-
-You will design and implement the scheduling logic and connect it to this Streamlit UI.
-"""
-    )
-
-with st.expander("What you need to build", expanded=True):
-    st.markdown(
-        """
-At minimum, your system should:
-- Represent pet care tasks (what needs to happen, how long it takes, priority)
-- Represent the pet and the owner (basic info and preferences)
-- Build a plan/schedule for a day that chooses and orders tasks based on constraints
-- Explain the plan (why each task was chosen and when it happens)
-"""
-    )
-
 st.divider()
 
-st.subheader("Quick Demo Inputs (UI only)")
-owner_name = st.text_input("Owner name", value="Jordan")
-pet_name = st.text_input("Pet name", value="Mochi")
-species = st.selectbox("Species", ["dog", "cat", "other"])
-availability = st.number_input("Time available today (minutes)", min_value=1, max_value=1440, value=90)
+st.subheader("Input Pet")
+owner_name = st.text_input("Owner name", placeholder="Enter your name")
+pet_name = st.text_input("Pet name", placeholder="Enter your pet's name")
+species = st.selectbox("Species", ["dog", "cat", "fish", "rabbit", "hamster"])
+availability = st.number_input("Time available today (minutes)", min_value=1, max_value=1440, placeholder=90)
 
 if "owner" not in st.session_state:
     st.session_state.owner = Owner(name=owner_name, availability=90)
@@ -74,7 +50,7 @@ if owner.pets:
     st.write("Your pets: " + ", ".join(f"{p.name} ({p.species})" for p in owner.pets))
 
 
-st.markdown("### Tasks")
+st.subheader("Input Task")
 st.caption("Give a task a preferred time (HH:MM) and set whether it repeats.")
 
 task_pet = st.selectbox("Pet for this task", [p.name for p in owner.pets]) if owner.pets else None
