@@ -143,7 +143,9 @@ def test_detect_conflicts_same_pet_and_different_pets():
     tom.add_task(Task("play", "fun", 5, "high", preference="15:00"))
     tom.add_task(Task("brush", "groom", 5, "low"))
     scheduler = Scheduler(owner)
-    scheduler.generate_plan()
+    # generate_plan() now refuses overlapping tasks, so feed detect_conflicts a hand-built
+    # plan to test the warning logic on its own.
+    scheduler.scheduled_items = owner.get_all_tasks()
 
     warnings = scheduler.detect_conflicts()
 
