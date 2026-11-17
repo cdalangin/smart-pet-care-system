@@ -1,6 +1,7 @@
-from datetime import datetime
+from datetime import datetime, time
 
 import streamlit as st
+import llm_suggester
 from pawpal_system import Owner, Pet, Scheduler, Task
 
 
@@ -175,7 +176,7 @@ if st.session_state.get("show_plan"):
                     "Task": t.name,
                     "Minutes": t.duration,
                     "Priority": t.priority,
-                    "Source": "💡 Suggested" if t.suggested else "Your task",
+                    "Source": ("✨ Suggested by Gemini" if t.source == "gemini" else "💡 Suggested") if t.suggested else "Your task",
                 }
                 for t in plan
             ]
@@ -190,24 +191,114 @@ if st.session_state.get("show_plan"):
         )
 
     declined = st.session_state.setdefault("declined", set())
-    suggestions = scheduler.suggest_tasks(declined)
+    gemini_ready = llm_suggester.is_configured()
+    use_gemini = st.toggle(
+        "Use Gemini for suggestions",
+        value=False,
+        disabled=not gemini_ready,
+        help="Needs GEMINI_API_KEY in your .env file." if not gemini_ready else None,
+    )
+    suggestions = []
+    gemini_ok = use_gemini
+    if use_gemini:
+        # Fetch from Gemini only when something the owner entered changes (availability or
+        # their own tasks). Accepting/declining a suggestion must NOT trigger a new call:
+        # the already-fetched pool is just filtered and re-validated against the new plan.
+        base_key = (
+            owner.availability,
+            tuple((t.pet_name, t.name, t.preference, t.duration) for t in plan if not t.suggested),
+        )
+        pool_cache = st.session_state.setdefault("gemini_pool", {})
+        if base_key not in pool_cache:
+            try:
+                with st.spinner("Asking Gemini for suggestions (gives up after 10s)..."):
+                    ideas = llm_suggester.propose(scheduler, declined)
+                pool_cache[base_key] = scheduler.build_suggestions(ideas, declined)
+            except llm_suggester.LLMUnavailable as err:
+                pool_cache[base_key] = None
+                st.session_state.gemini_error = str(err)
+        pool = pool_cache[base_key]
+        if pool is None:
+            gemini_ok = False
+            st.warning(f"⚠️ Gemini unavailable, showing built-in suggestions instead. ({st.session_state.get('gemini_error')})")
+            if st.button("Retry Gemini"):
+                pool_cache.pop(base_key, None)
+                st.rerun()
+            suggestions = scheduler.suggest_tasks(declined)
+        else:
+            # Drop declined/accepted ones and re-check fit and overlaps; no API call here.
+            suggestions = scheduler.build_suggestions(
+                [{"pet_name": t.pet_name, "name": t.name, "duration": t.duration,
+                  "time": t.preference, "reason": t.reason} for t in pool],
+                declined,
+            )
+    else:
+        suggestions = scheduler.suggest_tasks(declined)
+
     if suggestions:
         st.markdown("#### 💡 Suggested tasks")
         st.caption(
             f"You have {owner.availability - used} minutes free. Accept a suggestion to add it "
-            "to the schedule at the time shown, or decline it."
+            "to the schedule, change its start time first if you like, or decline it."
         )
         for i, s in enumerate(suggestions):
-            c1, c2, c3 = st.columns([5, 1, 1])
-            c1.write(f"💡 **{s.name}** for {s.pet_name} at **{s.preference}** ({s.duration} min, {s.priority} priority)")
-            if c2.button("Accept", key=f"accept_{i}_{s.pet_name}_{s.name}"):
-                pet = next(p for p in owner.pets if p.name == s.pet_name)
-                pet.add_task(s)
-                st.session_state.flash = f"Added suggested task '{s.name}' for {s.pet_name} at {s.preference}."
-                st.rerun()
-            if c3.button("Decline", key=f"decline_{i}_{s.pet_name}_{s.name}"):
+            c1, c2, c3, c4 = st.columns([4, 2, 1, 1])
+            by = "✨ Gemini" if s.source == "gemini" else "built-in rules"
+            c1.write(
+                f"💡 **{s.name}** for {s.pet_name} ({s.duration} min, {s.priority} priority) · _{by}_"
+                f"\n\n{s.reason}"
+            )
+            hh, mm = (int(x) for x in s.preference.split(":"))
+            # The suggested time is part of the key, so a re-placed suggestion resets the field.
+            picked = c2.time_input(
+                "Start time", value=time(hh, mm), step=300,
+                key=f"time_{s.pet_name}_{s.name}_{s.preference}",
+            )
+            chosen = f"{picked:%H:%M}"
+            clashes = scheduler.find_overlaps(chosen, s.duration)
+            past_midnight = picked.hour * 60 + picked.minute + s.duration > 24 * 60
+            if clashes:
+                st.error(
+                    f"{s.name} at {chosen} would overlap "
+                    + ", ".join(f"{t.name} ({t.pet_name}, {t.preference})" for t in clashes)
+                    + ". Pick a different start time."
+                )
+            elif past_midnight:
+                st.error(f"{s.name} would run past midnight. Pick an earlier start time.")
+            blocked = bool(clashes) or past_midnight
+            c3.write("")  # line the buttons up with the time field
+            if c3.button("Accept", key=f"accept_{i}_{s.pet_name}_{s.name}", disabled=blocked):
+                # Re-check on click so a conflicting time can never go through.
+                if scheduler.find_overlaps(chosen, s.duration):
+                    st.error("That time now conflicts with the schedule.")
+                else:
+                    s.preference = chosen
+                    pet = next(p for p in owner.pets if p.name == s.pet_name)
+                    pet.add_task(s)
+                    st.session_state.flash = f"Added suggested task '{s.name}' for {s.pet_name} at {s.preference}."
+                    st.rerun()
+            c4.write("")
+            if c4.button("Decline", key=f"decline_{i}_{s.pet_name}_{s.name}"):
                 declined.add((s.pet_name, s.name.lower()))
                 st.rerun()
 
     with st.expander("Why this plan?"):
-        st.text(scheduler.explain(suggestions))
+        explanation = None
+        if gemini_ok:
+            # Same key as the suggestions pool: accepting/declining reuses the same text.
+            facts_key = base_key
+            explain_cache = st.session_state.setdefault("explain_cache", {})
+            if facts_key not in explain_cache:
+                try:
+                    with st.spinner("Writing explanation..."):
+                        explain_cache[facts_key] = llm_suggester.explain_plan(scheduler, suggestions)
+                except llm_suggester.LLMUnavailable:
+                    explain_cache[facts_key] = None
+            explanation = explain_cache[facts_key]
+        if explanation:
+            st.write(explanation)
+            st.caption("✨ Written by Gemini")
+        else:
+            st.write(scheduler.explain_conversational(suggestions))
+            if use_gemini:
+                st.caption("Gemini couldn't write this one, so this explanation is from the built-in template.")

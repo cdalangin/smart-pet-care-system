@@ -23,6 +23,7 @@ class Task:
     due_date: date | None = None
     suggested: bool = False  # True when the task came from a suggestion
     reason: str = ""  # why it was suggested (blank for user-created tasks)
+    source: str = ""  # "rules" or "gemini" for suggested tasks, blank otherwise
 
     def __post_init__(self) -> None:
         """Reject non-positive durations and unknown priorities."""
@@ -204,7 +205,7 @@ class Scheduler:
                 time = f"{start // 60:02d}:{start % 60:02d}"
                 suggestions.append(Task(
                     name, "suggested", spec["duration"], spec["priority"],
-                    pet_name=pet.name, preference=time, frequency="once", suggested=True,
+                    pet_name=pet.name, preference=time, frequency="once", suggested=True, source="rules",
                     reason=(
                         f"{name} is {kind} that {pet.name} has no pending task for, "
                         f"it fits in the {minutes_left} unused minutes, and {time} is a "
@@ -215,6 +216,96 @@ class Scheduler:
                 taken.sort()
                 minutes_left -= spec["duration"]
         return suggestions
+
+    def build_suggestions(
+        self,
+        candidates: list[dict],
+        declined: set[tuple[str, str]] | None = None,
+        max_suggestions: int = 5,
+    ) -> list[Task]:
+        """Turn untrusted candidate dicts (e.g. from an LLM) into valid suggested Tasks.
+
+        Each candidate has pet_name, name, duration, time ('HH:MM') and reason. It is
+        dropped if the pet is unknown, the name is blank/duplicate/declined, the duration
+        is not a positive int within the minutes still free, or the reason is not text.
+        If the proposed time is invalid, outside the suggestion window or overlaps a
+        timed task, the task moves to the earliest free gap (dropped if none exists).
+        Call after generate_plan. Nothing is added to any pet.
+        """
+        declined = declined or set()
+        minutes_left = self.owner.availability - sum(t.duration for t in self.scheduled_items)
+        taken = sorted(
+            (start, start + t.duration)
+            for t in self.scheduled_items if t.preference
+            for start in [self._to_minutes(t.preference)]
+        )
+        pets = {p.name: p for p in self.owner.pets}
+        seen: set[tuple[str, str]] = set()
+        suggestions: list[Task] = []
+        for c in candidates:
+            if len(suggestions) >= max_suggestions:
+                break
+            if not isinstance(c, dict):
+                continue
+            pet = pets.get(c.get("pet_name"))
+            name = c.get("name")
+            duration = c.get("duration")
+            if pet is None or not isinstance(name, str) or not name.strip():
+                continue
+            name = name.strip()[:60]
+            key = (pet.name, name.lower())
+            pending = {t.name.lower() for t in pet.tasks if not t.completed}
+            if key in declined or key in seen or name.lower() in pending:
+                continue
+            if not isinstance(duration, int) or isinstance(duration, bool) or not 0 < duration <= minutes_left:
+                continue
+            start = None
+            try:
+                proposed = self._to_minutes(str(c.get("time")))
+                if (
+                    SUGGEST_START <= proposed and proposed + duration <= SUGGEST_END
+                    and all(proposed + duration <= s or proposed >= e for s, e in taken)
+                ):
+                    start = proposed
+            except ValueError:
+                pass
+            if start is None:
+                start = self._find_gap(taken, duration)
+            if start is None:
+                continue
+            reason = c.get("reason")
+            reason = reason.strip()[:300] if isinstance(reason, str) and reason.strip() else "Suggested by Gemini."
+            suggestions.append(Task(
+                name, "suggested", duration, "low", pet_name=pet.name,
+                preference=f"{start // 60:02d}:{start % 60:02d}", frequency="once",
+                suggested=True, source="gemini", reason=reason,
+            ))
+            seen.add(key)
+            taken.append((start, start + duration))
+            taken.sort()
+            minutes_left -= duration
+        return suggestions
+
+    def find_overlaps(self, start: str, duration: int, ignore: Task | None = None) -> list[Task]:
+        """Return scheduled tasks whose time window overlaps [start, start + duration).
+
+        Only tasks in scheduled_items with a preferred time count (call after
+        generate_plan). Back-to-back tasks, where one ends exactly as the other
+        starts, do not overlap. `ignore` is skipped, so a task can be checked
+        against everything except itself.
+
+        Args:
+            start: 'HH:MM' start time; raises ValueError if malformed.
+            duration: length in minutes.
+        """
+        begin = self._to_minutes(start)
+        end = begin + duration
+        return [
+            t for t in self.scheduled_items
+            if t is not ignore and t.preference
+            and begin < self._to_minutes(t.preference) + t.duration
+            and self._to_minutes(t.preference) < end
+        ]
 
     @staticmethod
     def _to_minutes(hhmm: str) -> int:
@@ -273,6 +364,40 @@ class Scheduler:
             key=lambda t: tuple(int(part) for part in t.preference.split(":")) if t.preference else (24, 0),
         )
 
+    def explain_conversational(self, suggestions: list[Task] | None = None) -> str:
+        """Return a 3-4 sentence, friendly explanation built from templates (no LLM).
+
+        This is the fallback for the Gemini-written version. It covers how the day was
+        filled, anything left out, and why a suggestion was offered.
+        """
+        used = sum(t.duration for t in self.scheduled_items)
+        available = self.owner.availability
+        n = len(self.scheduled_items)
+        sentences = [
+            f"You have {available} minutes today, and I scheduled {n} task{'s' if n != 1 else ''} "
+            f"using {used} of them, choosing the highest-priority tasks first and then ordering them by time."
+        ]
+        if self.skipped_tasks:
+            names = ", ".join(f"{t.name} for {t.pet_name}" for t in self.skipped_tasks)
+            many = len(self.skipped_tasks) > 1
+            sentences.append(
+                f"I had to leave out {names} because {'they' if many else 'it'} either overlapped "
+                f"a more important task or didn't fit in your time."
+            )
+        else:
+            sentences.append("Everything you added fit into your day without any overlaps.")
+        if suggestions:
+            first = suggestions[0]
+            more = f" and {len(suggestions) - 1} more" if len(suggestions) > 1 else ""
+            sentences.append(
+                f"Since you still have {available - used} minutes free, I'm suggesting {first.name} "
+                f"for {first.pet_name}{more}."
+            )
+            sentences.append(f"For example, {first.reason[0].lower() + first.reason[1:]}")
+        else:
+            sentences.append("There wasn't any spare time left to suggest extra tasks.")
+        return " ".join(sentences)
+
     def explain(self, suggestions: list[Task] | None = None) -> str:
         """Return a text explanation of why tasks were scheduled, skipped or suggested.
 
@@ -291,7 +416,7 @@ class Scheduler:
         ]
         for t in self.scheduled_items:
             when = f" at {t.preference}" if t.preference else ""
-            tag = " (suggested)" if t.suggested else ""
+            tag = (" (suggested by Gemini)" if t.source == "gemini" else " (suggested)") if t.suggested else ""
             lines.append(
                 f"  + {t.name}{tag} for {t.pet_name}{when}: "
                 f"{t.priority} priority, fits in {t.duration} min."
@@ -310,6 +435,7 @@ class Scheduler:
         if suggestions:
             lines.append("Suggested tasks (not in the plan until accepted):")
             for t in suggestions:
-                lines.append(f"  ? {t.name} for {t.pet_name} at {t.preference} ({t.duration} min)")
+                by = "Gemini" if t.source == "gemini" else "built-in rules"
+                lines.append(f"  ? {t.name} for {t.pet_name} at {t.preference} ({t.duration} min), from {by}")
                 lines.append(f"      Why: {t.reason}")
         return "\n".join(lines)
