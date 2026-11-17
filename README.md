@@ -136,3 +136,95 @@ Run with `python -m pytest`. **43 tests, all passing.**
 - **Gemini idea validation:** invalid ideas are dropped, bad or overlapping times are moved to a free slot, and the total never exceeds the free minutes.
 - **Failure handling:** a missing API key, temporary errors retried until they succeed, permanent errors not retried, and a long explanation cut to 4 sentences.
 - **Explanation fallback:** the template explanation is 3 to 4 sentences, with or without left-out and suggested tasks.
+
+## Reproducible Execution Evidence
+
+| Case | Input | What it demonstrates |
+|---|---|---|
+| 1 | Jordan, 90 min, dog with an overlapping task | End-to-end run with the rule-based path |
+| 2 | Maya, 60 min, cat, 5 messy Gemini ideas | AI feature behavior, and how its output is checked before the owner sees it |
+| 3 | Sam, 60 min, Gemini unavailable | Reliability: missing key, busy API, hard errors, fallback |
+
+### Case 1: End-to-end run (rule-based, no AI)
+
+**Input:** Jordan has 90 minutes. Biscuit (dog): *Morning walk* 08:00 (30 min, high), *Flea treatment* 08:15 (5 min, medium), *Brush teeth* 09:00 (5 min, low).
+
+**Output** (suggestion reasons abridged):
+```
+PLAN:
+  08:00 Morning walk for Biscuit (30 min, high)
+  09:00 Brush teeth for Biscuit (5 min, low)
+
+SUGGESTIONS (first 3):
+  07:00 Fresh water check for Biscuit (5 min, low)
+  07:05 Feeding for Biscuit (10 min, low)
+  07:15 Cuddle or bonding time for Biscuit (15 min, low)
+
+EXPLANATION:
+  You have 90 minutes today, and I scheduled 2 tasks using 35 of them, choosing the highest-priority tasks first and then ordering them by time. I had to leave out Flea treatment for Biscuit because it either overlapped a more important task or didn't fit in your time. Since you still have 55 minutes free, I'm suggesting Fresh water check for Biscuit and 2 more. 
+```
+
+**Checks:** all pass.
+- The overlapping lower-priority task (Flea treatment) was skipped and the plan has no overlaps.
+- Suggestions fit in the 55 free minutes, do not overlap the plan or each other, and each has a reason.
+- Editing a suggestion to 08:10 is detected as overlapping *Morning walk*, which is what blocks the **Accept** button in the app.
+
+### Case 2: AI feature behavior (Gemini ideas, validated in code)
+
+**Input:** Maya has 60 minutes. Luna (cat): *Feeding* 07:30 (10 min, high), leaving 50 free minutes. A stubbed Gemini reply (hand-written, in the JSON shape the model returns) proposes five ideas, four of them deliberately bad:
+
+```
+RAW GEMINI IDEAS (stub):
+  Luna  Wand toy play   15m at 08:00   <- fine
+  Rex   Walk            20m at 09:00   <- pet doesn't exist
+  Luna  Grooming        15m at 07:35   <- overlaps Feeding at 07:30
+  Luna  Feeding         10m at 10:00   <- already pending
+  Luna  Long training   90m at 11:00   <- longer than the free minutes
+```
+
+**Suggestion cards shown to the owner** (each reason is the model's own text, passed through unchanged):
+```
+  08:00 Wand toy play for Luna (15 min, low)  [source: gemini]
+      why: Daily play burns off energy and keeps an indoor cat healthy and happy.
+  07:00 Grooming for Luna (15 min, low)       [source: gemini]   <- moved from 07:35
+      why: Brushing cuts down on hairballs and keeps her coat in good shape.
+```
+
+**"Why this plan?" explanation.** 
+
+```
+Shown to the owner (labelled "Written by Gemini"):
+  You have 60 minutes today, and your one planned task, Luna's feeding at 07:30, takes just 10 of them.
+  Nothing had to be left out, which leaves you 50 free minutes to use. Since cats do best with regular
+  play, I suggested a 15-minute wand toy session for Luna at 08:00, right after her breakfast. I also
+  suggested 15 minutes of grooming at 07:00, a calm way to start the morning before she eats, which
+  helps with hairballs.
+```
+
+**Checks:** all pass.
+- The unknown pet, the duplicate of a pending task and the too-long idea were dropped.
+- The overlapping idea was moved to a free slot (07:35 became 07:00) instead of being scheduled on top of Feeding.
+- All suggestions fall inside the 07:00-21:00 window, and total suggested minutes stay within the free minutes.
+- An over-long explanation is cut to 4 sentences.
+
+This is the guardrail: Gemini only *proposes* ideas, and `Scheduler.build_suggestions` decides what gets shown, so a wrong answer from the model can't put an invalid task in the schedule.
+
+### Case 3: Reliability and fallback
+
+**Input:** Sam has 60 minutes. Rex (dog): *Walk* 08:00 (30 min, high). Gemini fails in three different ways:
+
+```
+A. No API key        -> LLMUnavailable: No GEMINI_API_KEY found in .env.
+B. 503, 503, then OK -> returned 'ok' after 3 calls (retried)
+C. 400 (bad request) -> LLMUnavailable after 1 call (not retried)
+
+FALLBACK (what the app shows instead):
+  07:00 Fresh water check for Rex (5 min, low)  [source: rules]
+  07:05 Feeding for Rex (10 min, low)           [source: rules]
+  07:15 Cuddle or bonding time for Rex (15 min, low)  [source: rules]
+```
+
+**Checks:** all pass.
+- A missing key raises a clear `LLMUnavailable` error instead of crashing.
+- Temporary errors (503) are retried until they succeed, and permanent errors (400) are not retried.
+- The rule-based suggestions are still valid and overlap-free, so the app keeps working. The app also shows the warning and **Retry Gemini** button.
