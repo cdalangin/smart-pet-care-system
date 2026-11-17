@@ -25,6 +25,9 @@ classDiagram
         +str frequency
         +bool completed
         +date due_date
+        +bool suggested
+        +str reason
+        +str source
         +__post_init__() None
         +mark_complete() None
     }
@@ -33,11 +36,53 @@ classDiagram
         +Owner owner
         +list~Task~ scheduled_items
         +list~Task~ skipped_tasks
+        +list~Task~ conflict_skipped
         +generate_plan() list~Task~
         +sort_by_time(tasks)$ list~Task~
         +detect_conflicts() list~str~
+        +find_overlaps(start, duration, ignore) list~Task~
+        +suggest_tasks(declined, max_suggestions) list~Task~
+        +build_suggestions(candidates, declined, max_suggestions) list~Task~
         +complete_task(task) Task
-        +explain() str
+        +explain_conversational(suggestions) str
+        +explain(suggestions) str
+        -_find_gap(taken, duration)$ int
+        -_to_minutes(hhmm)$ int
+    }
+
+    class PetTasks {
+        <<module pet_tasks.py>>
+        +SPECIES
+        +COMMON_TASKS
+        +SPECIES_TASKS
+        +tasks_for(species) list~dict~
+    }
+
+    class LLMSuggester {
+        <<module llm_suggester.py>>
+        +TOTAL_BUDGET_S = 10
+        +is_configured() bool
+        +propose(scheduler, declined, max_ideas) list~dict~
+        +explain_plan(scheduler, suggestions) str
+        -_build_prompt(scheduler, declined, max_ideas) str
+        -_generate(prompt, config, max_attempts) str
+    }
+
+    class LLMUnavailable {
+        <<exception>>
+    }
+
+    class GeminiAPI {
+        <<external service>>
+        API key read from .env
+    }
+
+    class StreamlitApp {
+        <<app.py>>
+        Gemini toggle - default off
+        Suggestion cards with editable start time
+        Accept - blocked on overlap / Decline
+        Why this plan? explanation
     }
 
     Owner "1" --> "*" Pet : has
@@ -45,7 +90,20 @@ classDiagram
     Scheduler "1" --> "1" Owner : schedules for
     Scheduler "1" o-- "*" Task : scheduled
     Scheduler "1" o-- "*" Task : skipped
+    Scheduler "1" o-- "*" Task : conflict_skipped
     Owner ..> Task : collects and filters
     Scheduler ..> Pet : complete_task adds next occurrence
     Scheduler ..> Task : creates recurring copy
     Task ..> Pet : pet_name (string key)
+
+    Scheduler ..> PetTasks : suggest_tasks uses built-in rules
+    Scheduler ..> Task : suggestions marked suggested=True
+    LLMSuggester ..> Scheduler : reads plan, free minutes, declined
+    LLMSuggester ..> GeminiAPI : 10s budget, retries 429/5xx
+    LLMSuggester ..> LLMUnavailable : raises on failure
+
+    StreamlitApp ..> Scheduler : generate_plan, find_overlaps
+    StreamlitApp ..> Scheduler : build_suggestions validates Gemini ideas
+    StreamlitApp ..> LLMSuggester : propose, explain_plan
+    StreamlitApp ..> Scheduler : fallback suggest_tasks, explain_conversational
+    StreamlitApp ..> Pet : Accept adds suggested task
